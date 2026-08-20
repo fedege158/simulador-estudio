@@ -7,7 +7,7 @@ from pypdf import PdfReader
 st.set_page_config(page_title="Motor de Estudio IA", page_icon="🧠", layout="centered")
 
 st.title("🧠 Motor de Estudio Semántico")
-st.caption("Generación continua de preguntas de examen sin repetición mediante Embeddings.")
+st.caption("Generación continua de preguntas sin repetición con detección dinámica de modelos.")
 
 # Inicialización de estado
 if "banco" not in st.session_state:
@@ -15,7 +15,33 @@ if "banco" not in st.session_state:
 if "pdf_texto" not in st.session_state:
     st.session_state.pdf_texto = ""
 
-# Funciones de comunicación con Gemini
+# --- COMUNICACIÓN DINÁMICA CON GEMINI ---
+
+def obtener_modelos_disponibles(api_key):
+    """Consulta directamente a Google la lista de modelos activos para tu API Key (igual que en HTML)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            models = data.get("models", [])
+            disponibles = []
+            for m in models:
+                methods = m.get("supportedGenerationMethods", [])
+                name = m.get("name", "").replace("models/", "")
+                # Filtrar solo modelos aptos para generar texto
+                if "generateContent" in methods:
+                    if not any(x in name for x in ["tts", "embedding", "imagen", "aqa", "bison"]):
+                        disponibles.append(name)
+            
+            # Priorizar modelos tipo 'flash'
+            disponibles.sort(key=lambda x: 0 if "flash" in x else 1)
+            if disponibles:
+                return disponibles
+    except Exception:
+        pass
+    return ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]
+
 def obtener_embedding(texto, api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}"
     payload = {
@@ -37,8 +63,7 @@ def similitud_coseno(v1, v2):
     return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
 def generar_con_gemini(prompt, api_key):
-    # Probar lista de modelos compatibles en orden
-    modelos = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]
+    modelos = obtener_modelos_disponibles(api_key)
     
     for modelo in modelos:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={api_key}"
@@ -50,16 +75,19 @@ def generar_con_gemini(prompt, api_key):
             res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=45)
             if res.status_code == 200:
                 data = res.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                st.warning(f"⚠️ El modelo {modelo} devolvió error HTTP {res.status_code}: {res.text}")
-        except Exception as e:
-            st.warning(f"⚠️ Error al conectar con {modelo}: {e}")
+                candidates = data.get("candidates", [])
+                if candidates and "content" in candidates[0]:
+                    parts = candidates[0]["content"].get("parts", [])
+                    if parts and "text" in parts[0]:
+                        st.info(f"✨ Preguntas generadas con éxito usando el modelo: **{modelo}**")
+                        return parts[0]["text"]
+        except Exception:
+            continue
             
-    st.error("❌ No se pudo obtener respuesta de ningún modelo de Gemini. Verificá tu API Key.")
+    st.error("❌ No se pudo obtener respuesta de ningún modelo disponible en tu cuenta. Verificá tu API Key.")
     return None
 
-# Panel Lateral
+# --- PANEL LATERAL ---
 with st.sidebar:
     st.header("⚙️ Ajustes y Archivos")
     api_key = st.text_input("Gemini API Key:", type="password", help="Tu clave de Google AI Studio")
@@ -88,7 +116,7 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Error al leer PDF: {e}")
 
-# Pestañas Principales
+# --- PESTAÑAS PRINCIPALES ---
 tab1, tab2, tab3 = st.tabs(["✨ Generador Antiduplicados", "📝 Simulador de Examen", "💾 Exportar Banco"])
 
 with tab1:
@@ -104,7 +132,7 @@ with tab1:
         elif not st.session_state.pdf_texto:
             st.error("Subí un archivo PDF en el menú lateral.")
         else:
-            with st.spinner("1/3 Procesando vectores semánticos del banco actual..."):
+            with st.spinner("1/3 Analizando modelos disponibles y procesando vectores..."):
                 vectores_existentes = []
                 for q in st.session_state.banco:
                     txt = q.get("pregunta") or q.get("statement") or ""
@@ -113,7 +141,7 @@ with tab1:
                         if emb:
                             vectores_existentes.append(emb)
 
-            with st.spinner("2/3 Generando preguntas con la API de Gemini..."):
+            with st.spinner("2/3 Generando contenido borrador con Gemini..."):
                 prompt = f"""
                 Actúa como un profesor universitario riguroso.
                 Analiza el siguiente texto y genera EXACTAMENTE {cant} preguntas de evaluación sobre detalles clave.
