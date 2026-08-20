@@ -8,7 +8,7 @@ from pypdf import PdfReader
 st.set_page_config(page_title="Simulador PDF & IA Gemini", page_icon="📂", layout="centered")
 
 st.title("📂 Simulador PDF & IA Gemini")
-st.caption("Sistema optimizado con caché de vectores y blindaje anti-repetición.")
+st.caption("Motor semántico optimizado: Permite múltiples detalles del mismo tema sin repetir preguntas.")
 
 # Inicialización del Estado de Sesión
 if "banco" not in st.session_state:
@@ -30,16 +30,8 @@ def extraer_paginas_de_texto(texto):
         paginas.extend([int(d) for d in digits if 0 < int(d) <= 1000])
     return sorted(list(set(paginas)))
 
-def limpiar_json_markdown(texto_raw):
-    """Limpia etiquetas ```json y marcas markdown de forma segura."""
-    if not texto_raw:
-        return ""
-    cleaned = re.sub(r'^```(?:json)?', '', texto_raw.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r'```$', '', cleaned.strip())
-    return cleaned.strip()
-
 def obtener_modelos_disponibles(api_key):
-    url = f"[https://generativelanguage.googleapis.com/v1beta/models?key=](https://generativelanguage.googleapis.com/v1beta/models?key=){api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     try:
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
@@ -60,9 +52,7 @@ def obtener_modelos_disponibles(api_key):
     return ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 def obtener_embedding(texto, api_key):
-    if not texto or not api_key:
-        return None
-    url = f"[https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=](https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=){api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}"
     payload = {
         "model": "models/text-embedding-004",
         "content": {"parts": [{"text": texto}]}
@@ -76,8 +66,6 @@ def obtener_embedding(texto, api_key):
     return None
 
 def similitud_coseno(v1, v2):
-    if not v1 or not v2:
-        return 0.0
     dot = sum(a * b for a, b in zip(v1, v2))
     norm_a = math.sqrt(sum(a * a for a in v1))
     norm_b = math.sqrt(sum(b * b for b in v2))
@@ -85,7 +73,7 @@ def similitud_coseno(v1, v2):
 
 def query_gemini(prompt_text, api_key, model_list):
     for model_name in model_list:
-        url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){model_name}:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
         payload = {
             "contents": [{"parts": [{"text": prompt_text}]}],
             "generationConfig": {
@@ -121,15 +109,12 @@ def normalizar_pregunta(q):
     correct_val = q.get("correctAnswer") or q.get("correcta") or q.get("correctIndex") or "1"
     correct_str = str(correct_val)
     
-    # Manejo seguro de índices base 0 o texto
-    if not correct_str.isdigit() or int(correct_str) < 1:
-        match_found = False
+    if not correct_str.isdigit():
         for o in opts:
             if o["text"].strip().lower() == correct_str.strip().lower():
                 correct_str = o["index"]
-                match_found = True
                 break
-        if not match_found:
+        if not correct_str.isdigit():
             correct_str = "1"
 
     explanation = q.get("explanation") or q.get("explicacion") or ""
@@ -142,8 +127,7 @@ def normalizar_pregunta(q):
         "options": opts,
         "correctIndex": correct_str,
         "explanation": explanation,
-        "pageNumbers": page_numbers,
-        "embedding": q.get("embedding")  # Preserva el vector si ya existe
+        "pageNumbers": page_numbers
     }
 
 # --- PANEL LATERAL ---
@@ -191,6 +175,7 @@ with tab1:
     dificultad = col3.selectbox("Dificultad", ["básico", "intermedio", "avanzado"], index=1)
     target_count = col4.number_input("Cant. Preguntas", min_value=1, max_value=50, value=5)
     
+    # Umbral por defecto optimizado en 0.83
     umbral = st.slider("🎯 Umbral de Filtro Semántico:", 0.70, 0.95, 0.83, 0.01, help="0.83 es el valor ideal: descarta la misma pregunta pero permite preguntar sobre otros detalles del mismo tema.")
 
     if st.button("✨ Generar Examen con IA", type="primary"):
@@ -287,7 +272,9 @@ CONTENIDO:
 
                     res = query_gemini(batch_prompt, api_key, model_list)
                     if res and res.get("text"):
-                        cleaned = limpiar_json_markdown(res["text"])
+                        cleaned = res["text"].strip()
+                        if cleaned.startswith("```"):
+                            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
                         parsed = json.loads(cleaned)
                         if isinstance(parsed, list):
                             raw_questions.extend(parsed)
@@ -337,19 +324,22 @@ CONTENIDO POR BLOQUES:
                 progress_bar.progress(40)
                 res = query_gemini(full_prompt, api_key, model_list)
                 if res and res.get("text"):
-                    cleaned = limpiar_json_markdown(res["text"])
+                    cleaned = res["text"].strip()
+                    if cleaned.startswith("```"):
+                        cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
                     raw_questions = json.loads(cleaned)
                     add_log(f"🟢 Examen recibido desde {res['model']}.")
 
             progress_bar.progress(85)
 
             if raw_questions:
-                add_log("3/3 Evaluando vectores semánticos con almacenamiento en caché...")
-                
-                # Optimización: Carga e indexación en caché de los vectores del banco actual
+                add_log("3/3 Evaluando vectores semánticos y aplicando filtro de precisión...")
+                vectores_existentes = []
                 for q in st.session_state.banco:
-                    if not q.get("embedding"):
-                        q["embedding"] = obtener_embedding(q["statement"], api_key)
+                    txt_stmt = q.get("statement") or q.get("pregunta") or ""
+                    emb = obtener_embedding(txt_stmt, api_key)
+                    if emb:
+                        vectores_existentes.append(emb)
 
                 aceptadas = 0
                 rechazadas = 0
@@ -358,15 +348,12 @@ CONTENIDO POR BLOQUES:
                     norm = normalizar_pregunta(raw_q)
                     if not norm:
                         continue
-                        
                     emb_nuevo = obtener_embedding(norm["statement"], api_key)
-                    norm["embedding"] = emb_nuevo
 
                     es_duplicada = False
-                    if emb_nuevo:
-                        for prev_q in st.session_state.banco:
-                            prev_emb = prev_q.get("embedding")
-                            if prev_emb and similitud_coseno(emb_nuevo, prev_emb) >= umbral:
+                    if emb_nuevo and vectores_existentes:
+                        for prev_emb in vectores_existentes:
+                            if similitud_coseno(emb_nuevo, prev_emb) >= umbral:
                                 es_duplicada = True
                                 break
 
@@ -374,6 +361,8 @@ CONTENIDO POR BLOQUES:
                         rechazadas += 1
                     else:
                         st.session_state.banco.append(norm)
+                        if emb_nuevo:
+                            vectores_existentes.append(emb_nuevo)
                         aceptadas += 1
 
                 progress_bar.progress(100)
@@ -426,13 +415,7 @@ with tab2:
 with tab3:
     st.subheader("💾 Exportar Banco de Preguntas")
     if st.session_state.banco:
-        # Remover propiedad 'embedding' antes de descargar para no abultar el JSON
-        exportable = []
-        for q in st.session_state.banco:
-            item = {k: v for k, v in q.items() if k != "embedding"}
-            exportable.append(item)
-            
-        json_str = json.dumps(exportable, ensure_ascii=False, indent=2)
+        json_str = json.dumps(st.session_state.banco, ensure_ascii=False, indent=2)
         st.download_button(
             label="📥 Descargar preguntas.json actualizado",
             data=json_str,
