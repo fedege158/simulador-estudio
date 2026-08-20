@@ -7,7 +7,7 @@ from pypdf import PdfReader
 st.set_page_config(page_title="Simulador PDF & IA Gemini", page_icon="📂", layout="centered")
 
 st.title("📂 Simulador PDF & IA Gemini")
-st.caption("Sistema de evaluación continua con blindaje anti-repetición y análisis por bloques.")
+st.caption("Sistema de evaluación continua con blindaje anti-repetición y lectura flexible de JSON.")
 
 # Inicialización del Estado de Sesión
 if "banco" not in st.session_state:
@@ -17,7 +17,7 @@ if "page_texts" not in st.session_state:
 if "total_pages" not in st.session_state:
     st.session_state.total_pages = 0
 
-# --- FUNCIONES DE COMUNICACIÓN CON GEMINI ---
+# --- FUNCIONES DE COMUNICACIÓN CON GEMINI Y NORMALIZACIÓN ---
 
 def obtener_modelos_disponibles(api_key):
     """Obtiene la lista de modelos de generación activos en la API Key."""
@@ -89,26 +89,28 @@ def extraer_temas(preguntas):
     temas = set()
     stopwords = {'artículo', 'articulo', 'art', 'según', 'segun', 'cual', 'como', 'donde', 'para', 'este', 'esta', 'sobre', 'mediante', 'que', 'con', 'los', 'las', 'del', 'por'}
     for q in preguntas:
-        txt = q.get("pregunta") or q.get("statement") or ""
+        txt = q.get("statement") or q.get("pregunta") or q.get("enunciado") or ""
         palabras = [p.lower() for p in txt.split() if len(p) > 4 and p.lower() not in stopwords]
         if len(palabras) >= 3:
             temas.add(" ".join(palabras[:3]))
     return list(temas)[:50]
 
 def normalizar_pregunta(q):
-    """Estructura las preguntas al formato estándar del simulador."""
-    statement = q.get("statement") or q.get("pregunta") or q.get("enunciado") or ""
-    raw_opts = q.get("options") or q.get("opciones") or []
+    """Normaliza cualquier formato de pregunta a la estructura interna estándar sin fallar."""
+    if not isinstance(q, dict):
+        return None
+
+    statement = q.get("statement") or q.get("pregunta") or q.get("enunciado") or "Sin enunciado"
+    raw_opts = q.get("options") or q.get("opciones") or q.get("choices") or []
     
     opts = []
     for idx, o in enumerate(raw_opts):
         txt = o.get("text") if isinstance(o, dict) else str(o)
         opts.append({"index": str(idx + 1), "text": txt})
         
-    correct_val = q.get("correctAnswer") or q.get("correcta") or "1"
+    correct_val = q.get("correctAnswer") or q.get("correcta") or q.get("correctIndex") or "1"
     correct_str = str(correct_val)
     
-    # Mapeo si correctAnswer vino como texto
     if not correct_str.isdigit():
         for o in opts:
             if o["text"].strip().lower() == correct_str.strip().lower():
@@ -139,6 +141,7 @@ with st.sidebar:
             data = json.load(json_file)
             raw_list = data if isinstance(data, list) else data.get("questions", [])
             st.session_state.banco = [normalizar_pregunta(q) for q in raw_list if q]
+            st.session_state.banco = [q for q in st.session_state.banco if q is not None]
             st.success(f"Cargadas {len(st.session_state.banco)} preguntas.")
         except Exception as e:
             st.error(f"Error en JSON: {e}")
@@ -195,12 +198,11 @@ with tab1:
             
             add_log(f"📄 Evaluando {total_pages_range} páginas del PDF (Págs {start} a {end})...")
 
-            # Construcción del Prompt de Exclusión (Exacto al HTML)
             existing_bank = st.session_state.banco
             avoid_prompt = ""
             if len(existing_bank) > 0:
                 topics = extraer_temas(existing_bank)
-                enunciados = "\n".join([f"{idx + 1}. {q.get('statement')}" for idx, q in enumerate(existing_bank)])
+                enunciados = "\n".join([f"{idx + 1}. {q.get('statement') or q.get('pregunta')}" for idx, q in enumerate(existing_bank)])
                 avoid_prompt = f"""
 ⛔ PROHIBICIÓN ABSOLUTA DE REPETICIÓN (LISTA NEGRA COMPLETA):
 El usuario YA TIENE las siguientes {len(existing_bank)} preguntas en su banco. 
@@ -223,7 +225,6 @@ REGLA DE LIBERTAD TOTAL DE FORMATO Y OPCIONES:
 
             raw_questions = []
 
-            # Algoritmo de división por Lotes o Bloques Temáticos (Idéntico a HTML)
             if total_pages_range > 35:
                 add_log("⚡ Modo PDF Extenso Activado: Procesando por sub-lotes.")
                 batch_count = min(3, math.ceil(total_pages_range / 35))
@@ -327,12 +328,12 @@ CONTENIDO POR BLOQUES:
 
             progress_bar.progress(85)
 
-            # Filtro de Rechazo Semántico Ciego (Embeddings Cosine)
             if raw_questions:
                 add_log("3/3 Procesando vectores semánticos y aplicando filtro antiduplicados...")
                 vectores_existentes = []
                 for q in st.session_state.banco:
-                    emb = obtener_embedding(q["statement"], api_key)
+                    txt_stmt = q.get("statement") or q.get("pregunta") or ""
+                    emb = obtener_embedding(txt_stmt, api_key)
                     if emb:
                         vectores_existentes.append(emb)
 
@@ -341,6 +342,8 @@ CONTENIDO POR BLOQUES:
 
                 for raw_q in raw_questions:
                     norm = normalizar_pregunta(raw_q)
+                    if not norm:
+                        continue
                     emb_nuevo = obtener_embedding(norm["statement"], api_key)
 
                     es_duplicada = False
@@ -374,21 +377,29 @@ with tab2:
         idx = num_q - 1
         
         q_act = st.session_state.banco[idx]
-        st.markdown(f"### **{num_q}. {q_act['statement']}**")
+        statement_text = q_act.get("statement") or q_act.get("pregunta") or q_act.get("enunciado") or "Sin enunciado"
         
-        opts_text = [o["text"] for o in q_act["options"]]
+        st.markdown(f"### **{num_q}. {statement_text}**")
+        
+        raw_opts = q_act.get("options") or q_act.get("opciones") or []
+        opts_text = [o["text"] if isinstance(o, dict) else str(o) for o in raw_opts]
+        
         if opts_text:
             eleccion = st.radio("Seleccioná tu respuesta:", opts_text, key=f"quiz_rad_{idx}")
             
             if st.button("Comprobar Respuesta", key=f"quiz_btn_{idx}"):
-                corr_idx = int(q_act["correctIndex"]) - 1
+                corr_val = q_act.get("correctIndex") or q_act.get("correcta") or 1
+                corr_idx = int(corr_val) - 1 if str(corr_val).isdigit() else 0
+                
                 if 0 <= corr_idx < len(opts_text):
                     if opts_text.index(eleccion) == corr_idx:
                         st.success("✅ ¡Correcto!")
                     else:
                         st.error(f"❌ Incorrecto. La opción correcta era: **{opts_text[corr_idx]}**")
                 
-                st.info(f"💡 **Explicación:** {q_act['explanation']}")
+                exp_text = q_act.get("explanation") or q_act.get("explicacion") or "Sin explicación provista."
+                st.info(f"💡 **Explicación:** {exp_text}")
+                
                 if q_act.get("pageNumbers"):
                     st.caption(f"📄 Páginas de referencia: {', '.join(map(str, q_act['pageNumbers']))}")
 
