@@ -4,21 +4,23 @@ import requests
 import streamlit as st
 from pypdf import PdfReader
 
-st.set_page_config(page_title="Motor de Estudio IA", page_icon="🧠", layout="centered")
+st.set_page_config(page_title="Simulador PDF & IA Gemini", page_icon="📂", layout="centered")
 
-st.title("🧠 Motor de Estudio Semántico")
-st.caption("Generación continua de preguntas sin repetición con detección dinámica de modelos.")
+st.title("📂 Simulador PDF & IA Gemini")
+st.caption("Sistema de evaluación continua con blindaje anti-repetición y análisis por bloques.")
 
-# Inicialización de estado
+# Inicialización del Estado de Sesión
 if "banco" not in st.session_state:
     st.session_state.banco = []
-if "pdf_texto" not in st.session_state:
-    st.session_state.pdf_texto = ""
+if "page_texts" not in st.session_state:
+    st.session_state.page_texts = {}
+if "total_pages" not in st.session_state:
+    st.session_state.total_pages = 0
 
-# --- COMUNICACIÓN DINÁMICA CON GEMINI ---
+# --- FUNCIONES DE COMUNICACIÓN CON GEMINI ---
 
 def obtener_modelos_disponibles(api_key):
-    """Consulta directamente a Google la lista de modelos activos para tu API Key (igual que en HTML)."""
+    """Obtiene la lista de modelos de generación activos en la API Key."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     try:
         res = requests.get(url, timeout=10)
@@ -29,18 +31,15 @@ def obtener_modelos_disponibles(api_key):
             for m in models:
                 methods = m.get("supportedGenerationMethods", [])
                 name = m.get("name", "").replace("models/", "")
-                # Filtrar solo modelos aptos para generar texto
                 if "generateContent" in methods:
                     if not any(x in name for x in ["tts", "embedding", "imagen", "aqa", "bison"]):
                         disponibles.append(name)
-            
-            # Priorizar modelos tipo 'flash'
             disponibles.sort(key=lambda x: 0 if "flash" in x else 1)
             if disponibles:
                 return disponibles
     except Exception:
         pass
-    return ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]
+    return ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
 
 def obtener_embedding(texto, api_key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}"
@@ -62,14 +61,15 @@ def similitud_coseno(v1, v2):
     norm_b = math.sqrt(sum(b * b for b in v2))
     return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
-def generar_con_gemini(prompt, api_key):
-    modelos = obtener_modelos_disponibles(api_key)
-    
-    for modelo in modelos:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent?key={api_key}"
+def query_gemini(prompt_text, api_key, model_list):
+    for model_name in model_list:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}
+            "contents": [{"parts": [{"text": prompt_text}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json"
+            }
         }
         try:
             res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=45)
@@ -79,163 +79,328 @@ def generar_con_gemini(prompt, api_key):
                 if candidates and "content" in candidates[0]:
                     parts = candidates[0]["content"].get("parts", [])
                     if parts and "text" in parts[0]:
-                        st.info(f"✨ Preguntas generadas con éxito usando el modelo: **{modelo}**")
-                        return parts[0]["text"]
+                        return {"text": parts[0]["text"], "model": model_name}
         except Exception:
             continue
-            
-    st.error("❌ No se pudo obtener respuesta de ningún modelo disponible en tu cuenta. Verificá tu API Key.")
     return None
+
+def extraer_temas(preguntas):
+    """Extrae palabras/temas clave para la lista negra del prompt."""
+    temas = set()
+    stopwords = {'artículo', 'articulo', 'art', 'según', 'segun', 'cual', 'como', 'donde', 'para', 'este', 'esta', 'sobre', 'mediante', 'que', 'con', 'los', 'las', 'del', 'por'}
+    for q in preguntas:
+        txt = q.get("pregunta") or q.get("statement") or ""
+        palabras = [p.lower() for p in txt.split() if len(p) > 4 and p.lower() not in stopwords]
+        if len(palabras) >= 3:
+            temas.add(" ".join(palabras[:3]))
+    return list(temas)[:50]
+
+def normalizar_pregunta(q):
+    """Estructura las preguntas al formato estándar del simulador."""
+    statement = q.get("statement") or q.get("pregunta") or q.get("enunciado") or ""
+    raw_opts = q.get("options") or q.get("opciones") or []
+    
+    opts = []
+    for idx, o in enumerate(raw_opts):
+        txt = o.get("text") if isinstance(o, dict) else str(o)
+        opts.append({"index": str(idx + 1), "text": txt})
+        
+    correct_val = q.get("correctAnswer") or q.get("correcta") or "1"
+    correct_str = str(correct_val)
+    
+    # Mapeo si correctAnswer vino como texto
+    if not correct_str.isdigit():
+        for o in opts:
+            if o["text"].strip().lower() == correct_str.strip().lower():
+                correct_str = o["index"]
+                break
+        if not correct_str.isdigit():
+            correct_str = "1"
+
+    return {
+        "statement": statement,
+        "options": opts,
+        "correctIndex": correct_str,
+        "explanation": q.get("explanation") or q.get("explicacion") or "",
+        "pageNumbers": q.get("pageNumbers") or []
+    }
 
 # --- PANEL LATERAL ---
 with st.sidebar:
-    st.header("⚙️ Ajustes y Archivos")
-    api_key = st.text_input("Gemini API Key:", type="password", help="Tu clave de Google AI Studio")
+    st.header("⚙️ Configuración")
+    api_key = st.text_input("Gemini API Key:", type="password")
     
-    json_file = st.file_uploader("Cargar JSON Existente (.json)", type=["json"])
-    pdf_file = st.file_uploader("Cargar PDF de Estudio (.pdf)", type=["pdf"])
+    st.subheader("📁 Carga de Archivos")
+    json_file = st.file_uploader("Banco de Preguntas (.json)", type=["json"])
+    pdf_file = st.file_uploader("Manual / Libro (.pdf)", type=["pdf"])
 
     if json_file:
         try:
             data = json.load(json_file)
-            st.session_state.banco = data if isinstance(data, list) else data.get("questions", [])
+            raw_list = data if isinstance(data, list) else data.get("questions", [])
+            st.session_state.banco = [normalizar_pregunta(q) for q in raw_list if q]
             st.success(f"Cargadas {len(st.session_state.banco)} preguntas.")
         except Exception as e:
-            st.error(f"Error al leer JSON: {e}")
+            st.error(f"Error en JSON: {e}")
 
     if pdf_file:
         try:
             reader = PdfReader(pdf_file)
-            texto = ""
+            st.session_state.total_pages = len(reader.pages)
+            st.session_state.page_texts = {}
             for i, page in enumerate(reader.pages):
                 txt = page.extract_text()
-                if txt:
-                    texto += f"\n[Página {i+1}]: " + txt
-            st.session_state.pdf_texto = texto
-            st.success(f"PDF procesado ({len(reader.pages)} págs).")
+                st.session_state.page_texts[i + 1] = txt if txt else ""
+            st.success(f"PDF cargado ({st.session_state.total_pages} págs).")
         except Exception as e:
             st.error(f"Error al leer PDF: {e}")
 
 # --- PESTAÑAS PRINCIPALES ---
-tab1, tab2, tab3 = st.tabs(["✨ Generador Antiduplicados", "📝 Simulador de Examen", "💾 Exportar Banco"])
+tab1, tab2, tab3 = st.tabs(["✨ Generar Examen con IA", "📝 Simulador de Examen", "💾 Exportar Banco"])
 
 with tab1:
-    st.subheader("Generar Preguntas Inéditas con IA")
-    col1, col2 = st.columns(2)
-    cant = col1.number_input("Cantidad a generar:", min_value=1, max_value=20, value=5)
-    umbral = col2.slider("Umbral de similitud (Filtro):", 0.60, 0.95, 0.80, 0.05)
-    instrucciones = st.text_area("Instrucciones o temas específicos:", placeholder="Ej: Centrarse en plazos, sanciones o artículos del capítulo 2.")
+    st.subheader("✨ Generar Examen con IA (Blindaje Anti-Repetición Activo)")
+    
+    instrucciones = st.text_area("Instrucciones extra para la IA (Opcional):", placeholder="Ej: Enfocarse en artículos específicos, plazos, montos o temas particulares...")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    p_start = col1.number_input("Pág. Inicio", min_value=1, max_value=max(1, st.session_state.total_pages), value=1)
+    p_end = col2.number_input("Pág. Fin", min_value=1, max_value=max(1, st.session_state.total_pages), value=min(10, max(1, st.session_state.total_pages)))
+    dificultad = col3.selectbox("Dificultad", ["básico", "intermedio", "avanzado"], index=1)
+    target_count = col4.number_input("Cant. Preguntas", min_value=1, max_value=50, value=5)
+    
+    umbral = st.slider("🎯 Umbral de Similitud (Filtro Semántico):", 0.65, 0.85, 0.80, 0.05)
 
-    if st.button("🚀 Generar Preguntas", type="primary"):
+    if st.button("✨ Generar Examen con IA", type="primary"):
         if not api_key:
             st.error("Ingresá tu API Key de Gemini en el menú lateral.")
-        elif not st.session_state.pdf_texto:
-            st.error("Subí un archivo PDF en el menú lateral.")
+        elif not st.session_state.page_texts:
+            st.error("Subí un archivo PDF primero en el menú lateral.")
         else:
-            with st.spinner("1/3 Analizando modelos disponibles y procesando vectores..."):
-                vectores_existentes = []
-                for q in st.session_state.banco:
-                    txt = q.get("pregunta") or q.get("statement") or ""
-                    if txt:
-                        emb = obtener_embedding(txt, api_key)
-                        if emb:
-                            vectores_existentes.append(emb)
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            log_box = st.empty()
+            logs = []
 
-            with st.spinner("2/3 Generando contenido borrador con Gemini..."):
-                prompt = f"""
-                Actúa como un profesor universitario riguroso.
-                Analiza el siguiente texto y genera EXACTAMENTE {cant} preguntas de evaluación sobre detalles clave.
-                {f'INSTRUCCIÓN ADICIONAL: {instrucciones}' if instrucciones else ''}
+            def add_log(msg):
+                logs.append(msg)
+                log_box.code("\n".join(logs))
 
-                Responde UNICAMENTE en formato JSON estricto con esta estructura:
-                [
-                  {{
-                    "pregunta": "Enunciado claro y concreto",
-                    "opciones": ["Opción A", "Opción B", "Opción C", "Opción D"],
-                    "correcta": 1,
-                    "explicacion": "Breve explicación técnica de la respuesta"
-                  }}
-                ]
+            status_text.text("🚀 Consultando modelos disponibles de Gemini...")
+            model_list = obtener_modelos_disponibles(api_key)
+            
+            start = int(p_start)
+            end = min(int(p_end), st.session_state.total_pages)
+            total_pages_range = (end - start + 1)
+            
+            add_log(f"📄 Evaluando {total_pages_range} páginas del PDF (Págs {start} a {end})...")
 
-                TEXTO DE ESTUDIO:
-                {st.session_state.pdf_texto[:30000]}
-                """
-                
-                raw_json = generar_con_gemini(prompt, api_key)
+            # Construcción del Prompt de Exclusión (Exacto al HTML)
+            existing_bank = st.session_state.banco
+            avoid_prompt = ""
+            if len(existing_bank) > 0:
+                topics = extraer_temas(existing_bank)
+                enunciados = "\n".join([f"{idx + 1}. {q.get('statement')}" for idx, q in enumerate(existing_bank)])
+                avoid_prompt = f"""
+⛔ PROHIBICIÓN ABSOLUTA DE REPETICIÓN (LISTA NEGRA COMPLETA):
+El usuario YA TIENE las siguientes {len(existing_bank)} preguntas en su banco. 
+ESTÁ ESTRICTAMENTE PROHIBIDO volver a formular preguntas sobre los mismos artículos, temas, conceptos o normas que aparezcan en esta lista. 
+Además, evita los siguientes temas ya cubiertos: {', '.join(topics)}.
+DEBES buscar detalles, incisos, números de artículos, excepciones o párrafos del PDF que NO hayan sido evaluados aún en esta lista.
 
-            if raw_json:
-                with st.spinner("3/3 Aplicando filtro semántico antiduplicados..."):
-                    try:
-                        cleaned = raw_json.strip()
+LISTA DE ENUNCIADOS YA EXISTENTES (NO REPETIR NI BUSCAR TEMAS SIMILARES):
+{enunciados}
+"""
+
+            format_rules = """
+REGLA DE LIBERTAD TOTAL DE FORMATO Y OPCIONES:
+- Evaluá el material con total criterio pedagógico.
+- Decidí LIBREMENTE si cada pregunta será de "Verdadero/Falso" o de "Opción Múltiple".
+- Para Opción Múltiple: NO hay límites en la cantidad de opciones (pueden ser 3, 4, 5, 6, etc.).
+- Para Verdadero/Falso: Usá exactamente 2 alternativas: ["Verdadero", "Falso"].
+- Asegurate de que "correctAnswer" sea la copia idéntica del texto de una de las opciones listadas.
+"""
+
+            raw_questions = []
+
+            # Algoritmo de división por Lotes o Bloques Temáticos (Idéntico a HTML)
+            if total_pages_range > 35:
+                add_log("⚡ Modo PDF Extenso Activado: Procesando por sub-lotes.")
+                batch_count = min(3, math.ceil(total_pages_range / 35))
+                questions_per_batch = math.ceil(target_count / batch_count)
+                batch_page_size = total_pages_range / batch_count
+
+                for b in range(batch_count):
+                    b_start = math.floor(start + (b * batch_page_size))
+                    b_end = end if (b == batch_count - 1) else math.floor(start + ((b + 1) * batch_page_size) - 1)
+                    count_for_batch = (target_count - len(raw_questions)) if (b == batch_count - 1) else questions_per_batch
+                    if count_for_batch <= 0:
+                        break
+
+                    batch_text = ""
+                    for p in range(b_start, b_end + 1):
+                        batch_text += f"[Página {p}]: {st.session_state.page_texts.get(p, '')}\n"
+
+                    add_log(f"▶ [Sub-lote {b + 1}/{batch_count}] Páginas {b_start} a {b_end}...")
+
+                    batch_prompt = f"""Actúa como docente evaluador universitario experto.
+Analiza las páginas {b_start} a {b_end} del documento.
+Genera EXACTAMENTE {count_for_batch} PREGUNTAS evaluando el contenido sustancial.
+Nivel: {dificultad.upper()}.
+{format_rules}
+{avoid_prompt}
+{f'INSTRUCCIÓN EXTRA: {instrucciones}' if instrucciones else ''}
+
+Devuelve un JSON estricto:
+[
+  {{
+    "statement": "Enunciado claro o afirmación a evaluar",
+    "options": ["Opción 1", "Opción 2", "..."],
+    "correctAnswer": "Opción 1",
+    "explanation": "Fundamentación técnica e indicación de página",
+    "pageNumbers": [{b_start}]
+  }}
+]
+
+CONTENIDO:
+{batch_text}"""
+
+                    res = query_gemini(batch_prompt, api_key, model_list)
+                    if res and res.get("text"):
+                        cleaned = res["text"].strip()
                         if cleaned.startswith("```"):
                             cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-                        
-                        nuevas_preguntas = json.loads(cleaned)
-                        aceptadas = 0
-                        rechazadas = 0
+                        parsed = json.loads(cleaned)
+                        if isinstance(parsed, list):
+                            raw_questions.extend(parsed)
+                        add_log(f"🟢 Sub-lote {b + 1} recibido desde {res['model']}.")
 
-                        for q in nuevas_preguntas:
-                            txt_nuevo = q.get("pregunta", "")
-                            emb_nuevo = obtener_embedding(txt_nuevo, api_key)
-                            
-                            es_duplicada = False
-                            if emb_nuevo and vectores_existentes:
-                                for prev_emb in vectores_existentes:
-                                    if similitud_coseno(emb_nuevo, prev_emb) >= umbral:
-                                        es_duplicada = True
-                                        break
-                            
-                            if es_duplicada:
-                                rechazadas += 1
-                            else:
-                                st.session_state.banco.append(q)
-                                if emb_nuevo:
-                                    vectores_existentes.append(emb_nuevo)
-                                aceptadas += 1
+                    pct = int(((b + 1) / batch_count) * 80)
+                    progress_bar.progress(pct)
 
-                        st.success(f"🎉 ¡Proceso finalizado! Se agregaron {aceptadas} preguntas únicas. ({rechazadas} rechazadas por similitud conceptual).")
-                    except Exception as e:
-                        st.error(f"Error al interpretar la respuesta JSON de la IA: {e}")
+            else:
+                add_log("⚡ Modo Conexión Única Rápida Activado por Bloques Temáticos...")
+                blocks_text_prompt = ""
+                chunk_size = total_pages_range / target_count
+
+                for i in range(target_count):
+                    chunk_start = math.floor(start + (i * chunk_size))
+                    chunk_end = end if (i == target_count - 1) else math.floor(start + ((i + 1) * chunk_size) - 1)
+                    if chunk_end < chunk_start:
+                        chunk_end = chunk_start
+
+                    chunk_text = ""
+                    for p in range(chunk_start, chunk_end + 1):
+                        chunk_text += f"[Página {p}]: {st.session_state.page_texts.get(p, '')}\n"
+                    blocks_text_prompt += f"\n=== BLOQUE TEMÁTICO {i + 1} (Páginas {chunk_start} a {chunk_end}) ===\n{chunk_text}\n"
+
+                full_prompt = f"""Actúa como docente evaluador universitario experto.
+Analiza el documento dividido en {target_count} bloques temáticos.
+Genera EXACTAMENTE {target_count} PREGUNTAS (1 por cada bloque).
+Nivel: {dificultad.upper()}.
+{format_rules}
+{avoid_prompt}
+{f'INSTRUCCIÓN ADICIONAL: {instrucciones}' if instrucciones else ''}
+
+Devuelve un JSON estricto:
+[
+  {{
+    "statement": "Enunciado o afirmación a evaluar",
+    "options": ["Opción A", "Opción B", "..."],
+    "correctAnswer": "Opción A",
+    "explanation": "Fundamentación técnica completa",
+    "pageNumbers": [{start}]
+  }}
+]
+
+CONTENIDO POR BLOQUES:
+{blocks_text_prompt}"""
+
+                progress_bar.progress(40)
+                res = query_gemini(full_prompt, api_key, model_list)
+                if res and res.get("text"):
+                    cleaned = res["text"].strip()
+                    if cleaned.startswith("```"):
+                        cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+                    raw_questions = json.loads(cleaned)
+                    add_log(f"🟢 Examen recibido desde {res['model']}.")
+
+            progress_bar.progress(85)
+
+            # Filtro de Rechazo Semántico Ciego (Embeddings Cosine)
+            if raw_questions:
+                add_log("3/3 Procesando vectores semánticos y aplicando filtro antiduplicados...")
+                vectores_existentes = []
+                for q in st.session_state.banco:
+                    emb = obtener_embedding(q["statement"], api_key)
+                    if emb:
+                        vectores_existentes.append(emb)
+
+                aceptadas = 0
+                rechazadas = 0
+
+                for raw_q in raw_questions:
+                    norm = normalizar_pregunta(raw_q)
+                    emb_nuevo = obtener_embedding(norm["statement"], api_key)
+
+                    es_duplicada = False
+                    if emb_nuevo and vectores_existentes:
+                        for prev_emb in vectores_existentes:
+                            if similitud_coseno(emb_nuevo, prev_emb) >= umbral:
+                                es_duplicada = True
+                                break
+
+                    if es_duplicada:
+                        rechazadas += 1
+                    else:
+                        st.session_state.banco.append(norm)
+                        if emb_nuevo:
+                            vectores_existentes.append(emb_nuevo)
+                        aceptadas += 1
+
+                progress_bar.progress(100)
+                status_text.empty()
+                add_log(f"✨ ¡Examen listo! Se agregaron {aceptadas} preguntas únicas. ({rechazadas} rechazadas por el filtro).")
+                st.balloons()
+                st.success(f"🎉 Se agregaron {aceptadas} preguntas inéditas al banco.")
 
 with tab2:
-    st.subheader("Simulador de Examen")
+    st.subheader("📝 Simulador de Examen")
     if not st.session_state.banco:
-        st.info("El banco está vacío. Subí un JSON o generá preguntas nuevas.")
+        st.info("El banco está vacío. Generá preguntas con la IA o cargá un JSON.")
     else:
         st.write(f"Total en banco: **{len(st.session_state.banco)} preguntas**")
-        num_q = st.number_input("Pregunta número:", min_value=1, max_value=len(st.session_state.banco), value=1)
+        num_q = st.number_input("Seleccionar pregunta:", min_value=1, max_value=len(st.session_state.banco), value=1)
         idx = num_q - 1
         
         q_act = st.session_state.banco[idx]
-        enunciado = q_act.get("pregunta") or q_act.get("statement") or "Sin enunciado"
-        st.markdown(f"### **{num_q}. {enunciado}**")
+        st.markdown(f"### **{num_q}. {q_act['statement']}**")
         
-        raw_opts = q_act.get("opciones") or q_act.get("options") or []
-        opts = [o.get("text") if isinstance(o, dict) else str(o) for o in raw_opts]
-        
-        if opts:
-            eleccion = st.radio("Seleccioná tu respuesta:", opts, key=f"rad_{idx}")
+        opts_text = [o["text"] for o in q_act["options"]]
+        if opts_text:
+            eleccion = st.radio("Seleccioná tu respuesta:", opts_text, key=f"quiz_rad_{idx}")
             
-            if st.button("Comprobar Respuesta", key=f"btn_{idx}"):
-                corr_val = q_act.get("correcta") or q_act.get("correctIndex") or 1
-                corr_idx = int(corr_val) - 1 if str(corr_val).isdigit() else 0
-                
-                if 0 <= corr_idx < len(opts):
-                    if opts.index(eleccion) == corr_idx:
+            if st.button("Comprobar Respuesta", key=f"quiz_btn_{idx}"):
+                corr_idx = int(q_act["correctIndex"]) - 1
+                if 0 <= corr_idx < len(opts_text):
+                    if opts_text.index(eleccion) == corr_idx:
                         st.success("✅ ¡Correcto!")
                     else:
-                        st.error(f"❌ Incorrecto. La opción correcta era: **{opts[corr_idx]}**")
-                st.info(f"💡 **Explicación:** {q_act.get('explicacion') or q_act.get('explanation', 'Sin explicación.')}")
+                        st.error(f"❌ Incorrecto. La opción correcta era: **{opts_text[corr_idx]}**")
+                
+                st.info(f"💡 **Explicación:** {q_act['explanation']}")
+                if q_act.get("pageNumbers"):
+                    st.caption(f"📄 Páginas de referencia: {', '.join(map(str, q_act['pageNumbers']))}")
 
 with tab3:
-    st.subheader("Descargar Banco de Preguntas")
+    st.subheader("💾 Exportar Banco de Preguntas")
     if st.session_state.banco:
         json_str = json.dumps(st.session_state.banco, ensure_ascii=False, indent=2)
         st.download_button(
-            label="📥 Descargar preguntas.json",
+            label="📥 Descargar preguntas.json actualizado",
             data=json_str,
-            file_name="preguntas_depuradas.json",
+            file_name="preguntas.json",
             mime="application/json"
         )
     else:
-        st.write("Aún no hay preguntas para descargar.")
+        st.write("Sin preguntas disponibles para descargar.")
