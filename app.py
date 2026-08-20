@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import requests
 import streamlit as st
 from pypdf import PdfReader
@@ -7,7 +8,7 @@ from pypdf import PdfReader
 st.set_page_config(page_title="Simulador PDF & IA Gemini", page_icon="📂", layout="centered")
 
 st.title("📂 Simulador PDF & IA Gemini")
-st.caption("Sistema de evaluación continua con blindaje anti-repetición y lectura flexible de JSON.")
+st.caption("Sistema de evaluación continua con referencia a páginas y lectura de texto fuente.")
 
 # Inicialización del Estado de Sesión
 if "banco" not in st.session_state:
@@ -17,10 +18,20 @@ if "page_texts" not in st.session_state:
 if "total_pages" not in st.session_state:
     st.session_state.total_pages = 0
 
-# --- FUNCIONES DE COMUNICACIÓN CON GEMINI Y NORMALIZACIÓN ---
+# --- FUNCIONES AUXILIARES ---
+
+def extraer_paginas_de_texto(texto):
+    """Extrae números de página del texto de explicación mediante expresiones regulares."""
+    if not texto:
+        return []
+    matches = re.findall(r'(?:páginas?|pág\.?|pp\.?|art\.?|artículo)?\s*([\d\s,y\-a]+)', texto, re.IGNORECASE)
+    paginas = []
+    for match in matches:
+        digits = re.findall(r'\b\d+\b', match)
+        paginas.extend([int(d) for d in digits if 0 < int(d) <= 1000])
+    return sorted(list(set(paginas)))
 
 def obtener_modelos_disponibles(api_key):
-    """Obtiene la lista de modelos de generación activos en la API Key."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
     try:
         res = requests.get(url, timeout=10)
@@ -85,7 +96,6 @@ def query_gemini(prompt_text, api_key, model_list):
     return None
 
 def extraer_temas(preguntas):
-    """Extrae palabras/temas clave para la lista negra del prompt."""
     temas = set()
     stopwords = {'artículo', 'articulo', 'art', 'según', 'segun', 'cual', 'como', 'donde', 'para', 'este', 'esta', 'sobre', 'mediante', 'que', 'con', 'los', 'las', 'del', 'por'}
     for q in preguntas:
@@ -96,7 +106,6 @@ def extraer_temas(preguntas):
     return list(temas)[:50]
 
 def normalizar_pregunta(q):
-    """Normaliza cualquier formato de pregunta a la estructura interna estándar sin fallar."""
     if not isinstance(q, dict):
         return None
 
@@ -119,12 +128,19 @@ def normalizar_pregunta(q):
         if not correct_str.isdigit():
             correct_str = "1"
 
+    explanation = q.get("explanation") or q.get("explicacion") or ""
+    
+    # Extraer páginas automáticamente si la lista está vacía
+    page_numbers = q.get("pageNumbers") or q.get("paginas") or []
+    if not page_numbers:
+        page_numbers = extraer_paginas_de_texto(explanation)
+
     return {
         "statement": statement,
         "options": opts,
         "correctIndex": correct_str,
-        "explanation": q.get("explanation") or q.get("explicacion") or "",
-        "pageNumbers": q.get("pageNumbers") or []
+        "explanation": explanation,
+        "pageNumbers": page_numbers
     }
 
 # --- PANEL LATERAL ---
@@ -162,7 +178,7 @@ with st.sidebar:
 tab1, tab2, tab3 = st.tabs(["✨ Generar Examen con IA", "📝 Simulador de Examen", "💾 Exportar Banco"])
 
 with tab1:
-    st.subheader("✨ Generar Examen con IA (Blindaje Anti-Repetición Activo)")
+    st.subheader("✨ Generar Examen con IA")
     
     instrucciones = st.text_area("Instrucciones extra para la IA (Opcional):", placeholder="Ej: Enfocarse en artículos específicos, plazos, montos o temas particulares...")
     
@@ -218,8 +234,9 @@ LISTA DE ENUNCIADOS YA EXISTENTES (NO REPETIR NI BUSCAR TEMAS SIMILARES):
 REGLA DE LIBERTAD TOTAL DE FORMATO Y OPCIONES:
 - Evaluá el material con total criterio pedagógico.
 - Decidí LIBREMENTE si cada pregunta será de "Verdadero/Falso" o de "Opción Múltiple".
-- Para Opción Múltiple: NO hay límites en la cantidad de opciones (pueden ser 3, 4, 5, 6, etc.).
+- Para Opción Múltiple: NO hay límites en la cantidad de opciones.
 - Para Verdadero/Falso: Usá exactamente 2 alternativas: ["Verdadero", "Falso"].
+- ES OBLIGATORIO incluir el número exacto de página del PDF en la "explanation" (ej: "Página 12") y en el arreglo "pageNumbers": [12].
 - Asegurate de que "correctAnswer" sea la copia idéntica del texto de una de las opciones listadas.
 """
 
@@ -258,7 +275,7 @@ Devuelve un JSON estricto:
     "statement": "Enunciado claro o afirmación a evaluar",
     "options": ["Opción 1", "Opción 2", "..."],
     "correctAnswer": "Opción 1",
-    "explanation": "Fundamentación técnica e indicación de página",
+    "explanation": "Fundamentación técnica e indicación de página (ej. Según la Página {b_start}...)",
     "pageNumbers": [{b_start}]
   }}
 ]
@@ -309,7 +326,7 @@ Devuelve un JSON estricto:
     "statement": "Enunciado o afirmación a evaluar",
     "options": ["Opción A", "Opción B", "..."],
     "correctAnswer": "Opción A",
-    "explanation": "Fundamentación técnica completa",
+    "explanation": "Fundamentación técnica indicando la página correspondiente (ej. Página {start})",
     "pageNumbers": [{start}]
   }}
 ]
@@ -400,8 +417,14 @@ with tab2:
                 exp_text = q_act.get("explanation") or q_act.get("explicacion") or "Sin explicación provista."
                 st.info(f"💡 **Explicación:** {exp_text}")
                 
-                if q_act.get("pageNumbers"):
-                    st.caption(f"📄 Páginas de referencia: {', '.join(map(str, q_act['pageNumbers']))}")
+                # Búsqueda y despliegue de las páginas del PDF de referencia
+                p_nums = q_act.get("pageNumbers") or extraer_paginas_de_texto(exp_text)
+                if p_nums:
+                    st.markdown(f"**📄 Páginas de referencia:** {', '.join(map(str, p_nums))}")
+                    for p in p_nums:
+                        if p in st.session_state.page_texts and st.session_state.page_texts[p]:
+                            with st.expander(f"📄 Ver fragmento original de la Página {p}"):
+                                st.text_area(f"Texto Página {p}:", value=st.session_state.page_texts[p], height=180, disabled=True, key=f"exp_txt_{idx}_{p}")
 
 with tab3:
     st.subheader("💾 Exportar Banco de Preguntas")
