@@ -8,7 +8,7 @@ from pypdf import PdfReader
 st.set_page_config(page_title="Simulador PDF & IA Gemini", page_icon="📂", layout="centered")
 
 st.title("📂 Simulador PDF & IA Gemini")
-st.caption("Sistema de evaluación continua con referencia a páginas y lectura de texto fuente.")
+st.caption("Motor semántico optimizado: Permite múltiples detalles del mismo tema sin repetir preguntas.")
 
 # Inicialización del Estado de Sesión
 if "banco" not in st.session_state:
@@ -21,7 +21,6 @@ if "total_pages" not in st.session_state:
 # --- FUNCIONES AUXILIARES ---
 
 def extraer_paginas_de_texto(texto):
-    """Extrae números de página del texto de explicación mediante expresiones regulares."""
     if not texto:
         return []
     matches = re.findall(r'(?:páginas?|pág\.?|pp\.?|art\.?|artículo)?\s*([\d\s,y\-a]+)', texto, re.IGNORECASE)
@@ -95,16 +94,6 @@ def query_gemini(prompt_text, api_key, model_list):
             continue
     return None
 
-def extraer_temas(preguntas):
-    temas = set()
-    stopwords = {'artículo', 'articulo', 'art', 'según', 'segun', 'cual', 'como', 'donde', 'para', 'este', 'esta', 'sobre', 'mediante', 'que', 'con', 'los', 'las', 'del', 'por'}
-    for q in preguntas:
-        txt = q.get("statement") or q.get("pregunta") or q.get("enunciado") or ""
-        palabras = [p.lower() for p in txt.split() if len(p) > 4 and p.lower() not in stopwords]
-        if len(palabras) >= 3:
-            temas.add(" ".join(palabras[:3]))
-    return list(temas)[:50]
-
 def normalizar_pregunta(q):
     if not isinstance(q, dict):
         return None
@@ -129,8 +118,6 @@ def normalizar_pregunta(q):
             correct_str = "1"
 
     explanation = q.get("explanation") or q.get("explicacion") or ""
-    
-    # Extraer páginas automáticamente si la lista está vacía
     page_numbers = q.get("pageNumbers") or q.get("paginas") or []
     if not page_numbers:
         page_numbers = extraer_paginas_de_texto(explanation)
@@ -158,7 +145,7 @@ with st.sidebar:
             raw_list = data if isinstance(data, list) else data.get("questions", [])
             st.session_state.banco = [normalizar_pregunta(q) for q in raw_list if q]
             st.session_state.banco = [q for q in st.session_state.banco if q is not None]
-            st.success(f"Cargadas {len(st.session_state.banco)} preguntas.")
+            st.success(f"Cargadas {len(st.session_state.banco)} preguntas analizadas.")
         except Exception as e:
             st.error(f"Error en JSON: {e}")
 
@@ -188,7 +175,8 @@ with tab1:
     dificultad = col3.selectbox("Dificultad", ["básico", "intermedio", "avanzado"], index=1)
     target_count = col4.number_input("Cant. Preguntas", min_value=1, max_value=50, value=5)
     
-    umbral = st.slider("🎯 Umbral de Similitud (Filtro Semántico):", 0.65, 0.85, 0.80, 0.05)
+    # Umbral por defecto optimizado en 0.83
+    umbral = st.slider("🎯 Umbral de Filtro Semántico:", 0.70, 0.95, 0.83, 0.01, help="0.83 es el valor ideal: descarta la misma pregunta pero permite preguntar sobre otros detalles del mismo tema.")
 
     if st.button("✨ Generar Examen con IA", type="primary"):
         if not api_key:
@@ -217,16 +205,15 @@ with tab1:
             existing_bank = st.session_state.banco
             avoid_prompt = ""
             if len(existing_bank) > 0:
-                topics = extraer_temas(existing_bank)
-                enunciados = "\n".join([f"{idx + 1}. {q.get('statement') or q.get('pregunta')}" for idx, q in enumerate(existing_bank)])
+                enunciados = "\n".join([f"- {q.get('statement') or q.get('pregunta')}" for q in existing_bank])
                 avoid_prompt = f"""
-⛔ PROHIBICIÓN ABSOLUTA DE REPETICIÓN (LISTA NEGRA COMPLETA):
-El usuario YA TIENE las siguientes {len(existing_bank)} preguntas en su banco. 
-ESTÁ ESTRICTAMENTE PROHIBIDO volver a formular preguntas sobre los mismos artículos, temas, conceptos o normas que aparezcan en esta lista. 
-Además, evita los siguientes temas ya cubiertos: {', '.join(topics)}.
-DEBES buscar detalles, incisos, números de artículos, excepciones o párrafos del PDF que NO hayan sido evaluados aún en esta lista.
+📌 REGLA DE NO REPETICIÓN CONCEPTUAL:
+El usuario ya tiene en su banco las preguntas listadas abajo.
+INSTRUCCIÓN ESPECÍFICA:
+- NO vuelvas a hacer la misma pregunta ni a evaluar exactamente el mismo dato/concepto.
+- SÍ PUEDES generar preguntas sobre el MISMO tema, artículo o capítulo, SIEMPRE Y CUANDO preguntes sobre UN DETALLE DIFERENTE (otro inciso, otro plazo, otra excepción o diferente condición) que no esté en la lista.
 
-LISTA DE ENUNCIADOS YA EXISTENTES (NO REPETIR NI BUSCAR TEMAS SIMILARES):
+LISTA DE PREGUNTAS YA EXISTENTES EN EL BANCO:
 {enunciados}
 """
 
@@ -346,7 +333,7 @@ CONTENIDO POR BLOQUES:
             progress_bar.progress(85)
 
             if raw_questions:
-                add_log("3/3 Procesando vectores semánticos y aplicando filtro antiduplicados...")
+                add_log("3/3 Evaluando vectores semánticos y aplicando filtro de precisión...")
                 vectores_existentes = []
                 for q in st.session_state.banco:
                     txt_stmt = q.get("statement") or q.get("pregunta") or ""
@@ -380,7 +367,7 @@ CONTENIDO POR BLOQUES:
 
                 progress_bar.progress(100)
                 status_text.empty()
-                add_log(f"✨ ¡Examen listo! Se agregaron {aceptadas} preguntas únicas. ({rechazadas} rechazadas por el filtro).")
+                add_log(f"✨ ¡Proceso terminado! Se agregaron {aceptadas} preguntas inéditas. ({rechazadas} rechazadas por ser la misma pregunta).")
                 st.balloons()
                 st.success(f"🎉 Se agregaron {aceptadas} preguntas inéditas al banco.")
 
@@ -417,7 +404,6 @@ with tab2:
                 exp_text = q_act.get("explanation") or q_act.get("explicacion") or "Sin explicación provista."
                 st.info(f"💡 **Explicación:** {exp_text}")
                 
-                # Búsqueda y despliegue de las páginas del PDF de referencia
                 p_nums = q_act.get("pageNumbers") or extraer_paginas_de_texto(exp_text)
                 if p_nums:
                     st.markdown(f"**📄 Páginas de referencia:** {', '.join(map(str, p_nums))}")
